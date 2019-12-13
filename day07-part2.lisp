@@ -1,11 +1,5 @@
-;;;; This code works for Part 1, but I would like to think of a different
-;;;; approach to handle Part 2.
-;;;; In this version, the intcode runner uses standard input/output for reads
-;;;; and writes, and then we can override them with string streams.
-;;;; But this approach needs extra work for part 2, because read doesn't
-;;;; block (it can block on interactive streams), it just finds EOF and returns
-;;;; immediately. One way to work around this is to poll with the listen
-;;;; function, but I'd like to try LispWorks-specific threading functionality.
+;;;; In this code, we use LispWorks-specific threading functions and mailboxes
+;;;; which are FIFO queues that threads can block on while reading.
 
 (defun load-memory (&optional (filename "input/day07.txt"))
   "Load the Intcode from the first line of the file as a vector of integers.
@@ -50,16 +44,16 @@ instruction will write to."
           (* (first p) (second p))))
   (+ ip 4))
 
-(defun opcode-3 (memory ip)
+(defun opcode-3 (memory ip in-mailbox)
   "Read input and store it at the first parameter."
   (let ((p (read-params memory ip 1 1)))
-    (setf (svref memory (first p)) (read)))
+    (setf (svref memory (first p)) (mp:mailbox-read in-mailbox)))
   (+ ip 2))
 
-(defun opcode-4 (memory ip)
+(defun opcode-4 (memory ip out-mailbox)
   "Output the value of the first parameter."
   (let ((p (read-params memory ip 1)))
-    (format t "~D" (first p)))
+    (mp:mailbox-send out-mailbox (first p)))
   (+ ip 2))
 
 (defun opcode-5 (memory ip)
@@ -102,61 +96,25 @@ stores 1 in the position given by the third parameter, otherwise 0."
   (declare (ignore memory ip))
   (error 'halt)) ; it's an error to not handle this condition
 
-(defun run (memory)
-  "Run then return the Intcode stored in memory as a vector of integers."
+(defun run (memory in-mailbox out-mailbox)
+  "Run then return the Intcode stored in memory as a vector of integers.
+The mailboxes are LispWorks mailboxes which are FIFO queues that allow
+communication between processes. Input is read from in-mailbox and output is
+sent to out-mailbox."
   (let ((ip 0)) ; instruction pointer
     (handler-case
         (loop
          (setf ip (ecase (rem (svref memory ip) 100)
                     (1 (opcode-1 memory ip))
                     (2 (opcode-2 memory ip))
-                    (3 (opcode-3 memory ip))
-                    (4 (opcode-4 memory ip))
+                    (3 (opcode-3 memory ip in-mailbox))
+                    (4 (opcode-4 memory ip out-mailbox))
                     (5 (opcode-5 memory ip))
                     (6 (opcode-6 memory ip))
                     (7 (opcode-7 memory ip))
                     (8 (opcode-8 memory ip))
                     (99 (opcode-99 memory ip)))))
       (halt () memory))))
-
-(defun run-returning-output (memory &key input)
-  "Run the program using the given string input and return the string output."
-  (with-input-from-string (*standard-input* input)
-    (with-output-to-string (*standard-output*)
-      (run (copy-seq memory)))))
-
-(defun test-io (memory &key input expected-output)
-  "Run the program using input as input and assert that the output matches
-expected-output."
-  (let ((output (run-returning-output memory :input input)))
-    (assert (string= expected-output output))))
-
-(defun run-amplifiers (memory phase-settings)
-  "Run the amplifier controller software on the five amplifiers connected in
-series and return the resulting output signal. The memory must be the amplifier
-controller software. The phase-settings must be a list of five integers, 0 to
-4, representing each amplifier's phase setting."
-  (let ((value "0")) ; the input and output values during the run
-    (dolist (phase phase-settings)
-      (let ((input (format nil "~A ~A" phase value)))
-        (setf value (run-returning-output (copy-seq memory) :input input))))
-    value))
-
-(defun test-part1 ()
-  "Test the examples in the problem description for part 1."
-  (assert (string= "43210"
-                   (run-amplifiers #(3 15 3 16 1002 16 10 16 1 16 15 15 4 15 99
-                                       0 0)
-                                   (list 4 3 2 1 0))))
-  (assert (string= "54321"
-                   (run-amplifiers #(3 23 3 24 1002 24 10 24 1002 23 -1 23 101
-                                       5 23 23 1 24 23 23 4 23 99 0 0)
-                                   (list 0 1 2 3 4))))
-  (assert (string= "65210"
-                   (run-amplifiers #(3 31 3 32 1002 32 10 32 1001 31 -2 31 1007
-                                       31 0 33 1002 33 7 33 1 33 31 31 1 32 31
-                                       31 4 31 99 0 0 0)
-                                   (list 1 0 4 3 2)))))
 
 (defun all-permutations (list)
   "Return a list of all permutations of the given list."
@@ -166,8 +124,47 @@ controller software. The phase-settings must be a list of five integers, 0 to
                  nconc (mapcar (lambda (l) (cons element l))
                                (all-permutations (remove element list)))))))
 
-(defun part1 ()
-  "Return the solution for part 1."
-  (loop with memory = (load-memory)
-        for phase-settings in (all-permutations (list 0 1 2 3 4))
-        maximize (parse-integer (run-amplifiers memory phase-settings))))
+
+(defun run-amplifiers (memory phase-settings)
+  "Run the five amplifiers in a feedback loop using the given phase settings.
+Return the last output signal from the last amplifier after all amplifiers have
+finished running. The memory must be the amplifier controller software, and the
+phase settings must be a list containing the numbers 5 through 9 in any order."
+  (let* ((mailboxes (loop for name in '("AB" "BC" "CD" "DE" "EA")
+                          collect (mp:make-mailbox :name name)))
+         (inboxes (append (last mailboxes) (butlast mailboxes)))
+         (processes (loop for name in '("A" "B" "C" "D" "E")
+                          for inbox in inboxes
+                          for outbox in mailboxes
+                          collect (mp:process-run-function
+                                   name () #'run (copy-seq memory)
+                                   inbox outbox))))
+    (loop for setting in phase-settings
+          for inbox in inboxes
+          do (mp:mailbox-send inbox setting))
+    (mp:mailbox-send (first inboxes) 0)
+    (loop for process in processes
+          do (mp:process-join process))
+    (mp:mailbox-read (first inboxes))))
+
+(defun max-thruster-signal (memory)
+  "Find the maximum thrust signal using every ordering of phase settings."
+  (loop for phase-settings in (all-permutations (list 5 6 7 8 9))
+        maximize (run-amplifiers memory phase-settings)))
+
+(defun test-part2 ()
+  "Test the examples in the problem description for part 2."
+  (assert (= 139629729
+             (max-thruster-signal #(3 26 1001 26 -4 26 3 27 1002 27 2 27 1 27
+                                      26 27 4 27 1001 28 -1 28 1005 28 6 99 0
+                                      0 5))))
+  (assert (= 18216
+             (max-thruster-signal #(3 52 1001 52 -5 52 3 53 1 52 56 54 1007 54
+                                      5 55 1005 55 26 1001 54 -5 54 1105 1 12 1
+                                      53 54 53 1008 54 0 55 1001 55 1 55 2 53
+                                      55 53 4 53 1001 56 -1 56 1005 56 6 99 0 0
+                                      0 0 10)))))
+
+(defun part2 ()
+  "Return the solution for part 2."
+  (max-thruster-signal (load-memory)))
