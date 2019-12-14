@@ -49,7 +49,8 @@ the parameter numbers (starting from 1) that the instructions will write to."
           for value = (read-mem (+ ip i) memory)
           collect (if writep
                       (ecase mode
-                        ((:position-mode :immediate-mode) value)
+                        (:position-mode value)
+                        ;; it's an error to write to an immediate mode parameter
                         (:relative-mode (+ base value)))
                     (ecase mode
                       (:position-mode (read-mem value memory))
