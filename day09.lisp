@@ -131,10 +131,7 @@ stores 1 in the position given by the third parameter, otherwise 0."
   (error 'halt)) ; it's an error to not handle this condition
 
 (defun run (memory)
-  "Run then return the Intcode stored in memory as a vector of integers.
-The mailboxes are LispWorks mailboxes which are FIFO queues that allow
-communication between processes. Input is read from in-mailbox and output is
-sent to out-mailbox."
+  "Run then return the Intcode stored in memory as a vector of integers."
   (let ((computer (make-instance 'computer :memory memory)))
     (handler-case
         (loop
